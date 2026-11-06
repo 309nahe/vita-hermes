@@ -21,13 +21,13 @@ aliases: [vita-hermes, Vita Hermes Client]
 > [!info] What changed since v1
 > | Your answer | Effect on the plan |
 > |---|---|
-> | Vita fully modded, HENkaku, "1.65 / 1.66" firmware | Treated as a good modding firmware (see the firmware note below). Plugins (taiHEN, vitacompanion) and "unsafe homebrew" are available. |
+> | Vita fully modded, firmware **3.65 + Ensō** | Best-case setup: permanent boot mod, taiHEN plugins (vitacompanion, debug logger) always on, "unsafe homebrew" available. |
 > | Hermes on a **VPS** | HTTPS and auth become core. TLS work moves from a late milestone to M3. Bridge is now **required**, not optional. Security section added. |
 > | **English** only | Dropped CJK/emoji font work and multi-language IME concerns. Smaller font assets, simpler text layout. |
 > | "I want it customizable" | New customization architecture, config schema, themes, profiles, macros, optional scripting. Milestones re-ordered so config exists before the UI is built out. |
 
-> [!warning] Firmware number
-> Vita firmware versions are written **3.xx** (for example 3.60, 3.65, 3.68, 3.74), so "1.65 / 1.66" is most likely **3.65** (or a nearby version). That does not change the plan, but please confirm the exact number with *Settings > System > System Information*. Details that depend on it (permanent Ensō boot vs re-running the exploit each boot, plugin compatibility) should be **verified** against the HENkaku/taiHEN docs for your exact version.
+> [!success] Firmware confirmed
+> Firmware **3.65 with Ensō installed** (confirmed by you). That is the best-supported modding setup: HENkaku/taiHEN are loaded at every boot with no re-running an exploit, so plugins such as vitacompanion and a network debug logger are always available. Still **verify** plugin versions against the taiHEN/vitacompanion READMEs.
 
 > [!warning] Unverified items
 > No existing Hermes Agent client for the 3DS turned up in my search. Hermes API details come from the official repo and third-party integration docs, and Vita API specifics from general knowledge of the VitaSDK ecosystem. Items marked **verify** need checking. The repo was empty, so I have not inspected your Hermes install.
@@ -498,7 +498,7 @@ Times assume part-time work by one developer comfortable with C/C++. Milestones 
 - [ ] Record raw SSE output into `docs/samples/`; write `tools/mock_hermes.py` that replays it.
 - [ ] Confirm session behavior (server-side context or resend history) and what the stream shows during tool use.
 - [ ] Decide bridge implementation (FastAPI vs Go) and write the minimal token-checking bridge.
-- [ ] Confirm exact firmware, FTP and plugin setup on the Vita.
+- [ ] Check VitaShell FTP and install the vitacompanion plugin on the Vita (firmware 3.65 + Ensō already confirmed).
 
 **Exit:** protocol notes written; HTTPS streaming proven from the desktop; bridge skeleton running.
 
@@ -624,7 +624,7 @@ Times assume part-time work by one developer comfortable with C/C++. Milestones 
 
 > [!question] Answer inline or reply with the numbers. Defaults in brackets are what I will assume.
 
-1. **Exact firmware** from *Settings > System > System Information* [assume 3.65]. Is Ensō installed (permanent) or do you re-run the exploit after each boot?
+1. ~~Firmware~~ Confirmed: 3.65 with Ensō.
 2. **VPS details**: OS, do you already have a **domain name** for it, and is Caddy/nginx already running there? [assume Linux + a domain you can point at it]
 3. **Hermes version** and whether the API server is already enabled. [assume not yet]
 4. **Voice** (mic input, spoken replies): needed soon or later? [later, v2]
