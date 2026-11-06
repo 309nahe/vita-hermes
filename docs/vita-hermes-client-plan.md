@@ -1,22 +1,36 @@
 ---
 title: PS Vita client for Hermes Agent - feasibility and implementation plan
 created: 2026-11-06
+updated: 2026-11-06
+version: 2
 status: draft-for-review
 tags: [hermes, psvita, homebrew, vitasdk, plan]
 aliases: [vita-hermes, Vita Hermes Client]
 ---
 
-# PS Vita client for Hermes Agent: feasibility and implementation plan
+# PS Vita client for Hermes Agent: feasibility and implementation plan (v2)
 
 > [!abstract] TL;DR
-> - **Feasible, medium complexity.** A text chat client with streaming replies is a small project: about 1-2 weekends for an MVP if you know C or C++. A polished client with voice, camera and approvals is about 6-8 weeks part-time.
-> - **The Vita is a better target than the 3DS.** It has a quad-core ARM, 512 MB RAM, a 960x544 screen, Wi-Fi n and a mature toolchain (VitaSDK).
-> - **The only really hard problem is TLS and trust.** The Vita's system SSL stack and certificate store are old. So the Vita should talk **plain HTTP on your LAN** to a small **bridge/reverse proxy**, and the bridge handles TLS, auth and payload shaping. Details in [[#5. Limits and how to overcome them]].
-> - **Recommended stack:** C++17 + VitaSDK + vita2d (rendering) + libcurl (HTTP/SSE) + yyjson or cJSON, with a **platform-independent core** that also builds as an SDL2 desktop app on Fedora. This lets you develop 80% of the app without touching the Vita.
-> - **Assumption to confirm:** your Vita is already modded (HENkaku/Enso or equivalent). Without that, none of this runs. See [[#Open questions for you]].
+> - **Feasible, medium complexity.** Streaming text chat MVP: about 1-2 weekends. Full customizable client with voice: about 7-9 weeks part-time.
+> - **Your VPS setup changes the hard problem.** The Vita must reach Hermes **over the internet, so HTTPS is mandatory**, not optional. The Vita's built-in SSL stack is too old, so the app **ships its own TLS (libcurl + mbedTLS) with its own bundled CA certificates**. A small **bridge behind Caddy** on the VPS gives the Vita a narrow, revocable, rate-limited door into Hermes.
+> - **Security matters more than in v1.** A Hermes agent can run tools on your VPS. A lost or cloned Vita token is effectively remote access to that agent. The plan scopes, rotates and revokes tokens. See [[#6. Security model for a public VPS]].
+> - **Customization is a first-class design goal**, not an afterthought: JSON config, profiles, themes, button mapping, quick-prompt macros, all editable on the Vita or over FTP, with optional Lua scripting later. See [[#5. Customization architecture]].
+> - **English only** simplifies fonts, input and layout a lot. No CJK or complex-script work.
+> - **Stack:** C++17, VitaSDK, vita2d, libcurl + mbedTLS, yyjson. A platform-independent core also builds as a desktop SDL2 app on Fedora for fast iteration.
+
+> [!info] What changed since v1
+> | Your answer | Effect on the plan |
+> |---|---|
+> | Vita fully modded, HENkaku, "1.65 / 1.66" firmware | Treated as a good modding firmware (see the firmware note below). Plugins (taiHEN, vitacompanion) and "unsafe homebrew" are available. |
+> | Hermes on a **VPS** | HTTPS and auth become core. TLS work moves from a late milestone to M3. Bridge is now **required**, not optional. Security section added. |
+> | **English** only | Dropped CJK/emoji font work and multi-language IME concerns. Smaller font assets, simpler text layout. |
+> | "I want it customizable" | New customization architecture, config schema, themes, profiles, macros, optional scripting. Milestones re-ordered so config exists before the UI is built out. |
+
+> [!warning] Firmware number
+> Vita firmware versions are written **3.xx** (for example 3.60, 3.65, 3.68, 3.74), so "1.65 / 1.66" is most likely **3.65** (or a nearby version). That does not change the plan, but please confirm the exact number with *Settings > System > System Information*. Details that depend on it (permanent Ensō boot vs re-running the exploit each boot, plugin compatibility) should be **verified** against the HENkaku/taiHEN docs for your exact version.
 
 > [!warning] Unverified items
-> I could not find an existing Hermes Agent client for the 3DS (see [[#Sources]]). The Hermes API details below come from the official repo and third-party integration docs. Items marked **verify** should be checked against your Hermes version before you rely on them. The repo this document lives in was empty when I wrote it, so I have not inspected your Hermes setup.
+> No existing Hermes Agent client for the 3DS turned up in my search. Hermes API details come from the official repo and third-party integration docs, and Vita API specifics from general knowledge of the VitaSDK ecosystem. Items marked **verify** need checking. The repo was empty, so I have not inspected your Hermes install.
 
 ---
 
@@ -26,50 +40,52 @@ aliases: [vita-hermes, Vita Hermes Client]
 2. [[#2. Local dev environment on Fedora]]
 3. [[#3. Technology choices]]
 4. [[#4. Architecture]]
-5. [[#5. Limits and how to overcome them]]
-6. [[#6. Implementation plan (milestones)]]
-7. [[#7. Complexity and effort estimate]]
-8. [[#8. Risks]]
-9. [[#9. Alternatives considered]]
-10. [[#Open questions for you]]
-11. [[#Sources]]
+5. [[#5. Customization architecture]]
+6. [[#6. Security model for a public VPS]]
+7. [[#7. Limits and how to overcome them]]
+8. [[#8. Implementation plan (milestones)]]
+9. [[#9. Complexity and effort estimate]]
+10. [[#10. Risks]]
+11. [[#11. Alternatives considered]]
+12. [[#Open questions for you]]
+13. [[#Sources]]
 
 ---
 
 ## 1. What we are building
 
-A homebrew app (`.vpk`) for the PS Vita that is a **thin client for a Hermes Agent running elsewhere** (your PC, a server, a Raspberry Pi). The Vita does no AI work. It renders a chat UI and shows streamed answers.
+A homebrew app (`.vpk`) for the PS Vita that is a **thin client for the Hermes Agent running on your VPS**. The Vita does no AI work: it renders a chat UI, streams replies, and gives you a highly configurable way to talk to the agent.
 
 ### What Hermes gives us
 
-Hermes Agent (Nous Research) can expose an **OpenAI-compatible HTTP API server**. From the docs I found:
+Hermes Agent (Nous Research) can expose an **OpenAI-compatible HTTP API server**:
 
 | Item | Value | Status |
 |---|---|---|
 | Enable | `API_SERVER_ENABLED=true` and `API_SERVER_KEY=<secret>` in the Hermes env file, then `hermes gateway` | per Open WebUI docs, **verify** |
 | Default port / bind | `8642`, `127.0.0.1` (localhost only) | **verify** |
-| Base URL for clients | `http://<host>:8642/v1` | **verify** |
-| Auth | `Authorization: Bearer <API_SERVER_KEY>`. Keys shorter than 16 chars reportedly make the API silently not serve. | **verify** |
+| Base URL | `http://127.0.0.1:8642/v1` on the VPS | **verify** |
+| Auth | `Authorization: Bearer <API_SERVER_KEY>`. Keys under 16 characters reportedly make the API silently not serve. | **verify** |
 | Endpoints we need | `GET /v1/models` (or a health route), `POST /v1/chat/completions` with `"stream": true` (SSE) | **verify** |
-| Sessions | Unknown whether Hermes keeps server-side sessions per client. Fallback: the client sends the full message list each call, like any OpenAI client. | **verify** |
+| Sessions | Unknown whether Hermes keeps server-side context per client. Fallback: the client resends the message list each call. | **verify** |
 
-> [!tip]
-> Because the API is OpenAI-compatible, the Vita client is also a generic OpenAI-compatible chat client. It will work against other backends too, which is handy for testing without a full Hermes install.
+> [!tip] Good news for the VPS case
+> Hermes binds to localhost by default. **Keep it that way.** Only the bridge and Caddy face the internet; Hermes itself is never exposed directly.
 
 ### Feature tiers
 
 | Tier | Features |
 |---|---|
-| **MVP** | Settings (host, port, key), on-screen keyboard input, streamed text replies, scrollback, "new chat" |
-| **v1** | Multiple conversations saved to `ux0:data/`, basic Markdown (headings, bold, code blocks, lists), error and reconnect handling, power-saving options |
-| **v2** | Voice input (Vita mic, then speech-to-text on the bridge), TTS playback of replies, image attach from camera or memory card, tool-call / "agent is working" status line |
-| **v3 (fun)** | Approve or deny risky agent actions from the Vita, rear-touch scrolling, gyro gestures, LiveArea notifications |
+| **MVP** | Settings (host, token), on-screen keyboard, streamed replies over HTTPS, scrollback, "new chat" |
+| **v1** | **Customization layer** (profiles, themes, button mapping, quick prompts), saved conversations, basic Markdown, error/reconnect handling, power saving |
+| **v2** | Voice input (Vita mic, STT on the VPS), TTS playback, camera/image attach, tool-activity status |
+| **v3** | Lua scripting for custom commands and widgets, approve/deny agent actions from the Vita, rear-touch and gyro gestures, notifications |
 
 ---
 
 ## 2. Local dev environment on Fedora
 
-Goal: build a `.vpk` on Fedora, copy it to the Vita over FTP, launch it, read logs and crash dumps. In parallel, build the same app as a desktop SDL2 binary for fast iteration.
+Goal: build a `.vpk` on Fedora, push it to the Vita over FTP, launch it, read logs and crash dumps. In parallel, build the same app as a desktop SDL2 binary for fast iteration.
 
 ### 2.1 Packages
 
@@ -83,15 +99,13 @@ sudo dnf install -y \
   lftp
 ```
 
-- `SDL2-devel`, `SDL2_ttf-devel` and `libcurl-devel` are for the **desktop build** (see [[#4. Architecture]]).
-- `lftp` is a convenient FTP client for pushing builds to the Vita.
-- If the prebuilt VitaSDK binaries complain about a missing shared library, install the matching compat package (for example `ncurses-compat-libs`) or build the toolchain from source via the vitasdk buildscripts.
+- `SDL2-devel`, `SDL2_ttf-devel` and `libcurl-devel` are for the **desktop build** ([[#4. Architecture]]).
+- `lftp` is a convenient FTP client for pushing builds.
+- If the prebuilt VitaSDK binaries complain about a missing shared library, install the matching compat package (for example `ncurses-compat-libs`) or build the toolchain from the vitasdk buildscripts.
 
 ### 2.2 Install VitaSDK
 
-The official route is **vdpm** (VitaSDK Package Manager), which bootstraps a prebuilt toolchain and installs ports of common libraries (libcurl, mbedTLS, freetype, vita2d, and so on).
-
-I recommend installing under your home directory to avoid `sudo` for every update:
+The official route is **vdpm** (VitaSDK Package Manager): it bootstraps a prebuilt toolchain and installs ports of common libraries (libcurl, mbedTLS, freetype, vita2d, ...).
 
 ```bash
 # 1. Environment (add to ~/.bashrc or ~/.zshrc)
@@ -102,8 +116,7 @@ export PATH="$VITASDK/bin:$PATH"
 git clone https://github.com/vitasdk/vdpm ~/src/vdpm
 cd ~/src/vdpm
 ./bootstrap-vitasdk.sh
-./install-all.sh          # installs all ports; takes a while
-                          # (or install only what we need, see below)
+./install-all.sh          # or install only what we need, see below
 
 # 3. Sanity check
 arm-vita-eabi-gcc --version
@@ -111,13 +124,14 @@ vita-mksfoex 2>&1 | head -1
 ```
 
 > [!note]
-> The vdpm README documents `/usr/local/vitasdk` as the default location. `VITASDK` is what the build tooling reads, so a home-directory path works as long as it is exported. One gist I found says the vdpm-downloaded toolchain can be outdated and recommends the autobuilds releases or the buildscripts repo. Check the vdpm README for the currently recommended bootstrap before running it. To update later, re-run the bootstrap and the library install.
+> The vdpm README documents `/usr/local/vitasdk` as the default location; a home-directory path works as long as `VITASDK` is exported. One gist I found says the vdpm-downloaded toolchain can be outdated and recommends autobuilds releases or the buildscripts repo. Check the vdpm README for the current recommended bootstrap before running it.
 
-Minimum libraries for this project (install individually if you do not want `install-all.sh`):
+Libraries for this project: `vita2d`, `libcurl`, `mbedtls`, `zlib`, `freetype`, `libpng`, `libjpeg-turbo`, `yyjson` (or `cjson`). Later: `opusfile` or `libvorbis` (audio), and `lua` (scripting, or vendor the source).
 
-`vita2d`, `libcurl` (with `mbedtls` and `zlib`), `freetype`, `libpng`, `libjpeg-turbo`, `yyjson` or `cjson`. For v2 add `opusfile` or `libvorbis` for audio decoding.
+> [!important] TLS on the Vita
+> We link **libcurl against mbedTLS** and bundle our own CA file. We do **not** use the console's system SSL library. See [[#7.1 TLS and certificates]]. Before relying on it, confirm which TLS versions and cipher suites the vdpm mbedTLS port supports (TLS 1.2 with ECDHE + AES-GCM is what we need; **verify**).
 
-### 2.3 Project skeleton check (hello world)
+### 2.3 Project skeleton check
 
 ```bash
 mkdir -p ~/src/vita-hermes && cd ~/src/vita-hermes
@@ -125,17 +139,14 @@ cmake -S . -B build-vita -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build-vita
-# produces build-vita/vita-hermes.vpk when the CMakeLists uses vita_create_vpk()
 ```
 
-A minimal `CMakeLists.txt` uses the VitaSDK helper macros:
+Minimal `CMakeLists.txt` using the VitaSDK macros:
 
 ```cmake
 cmake_minimum_required(VERSION 3.16)
-if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
-  if(DEFINED ENV{VITASDK})
-    set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "")
-  endif()
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VITASDK})
+  set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "")
 endif()
 project(vita_hermes CXX C)
 include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
@@ -155,39 +166,38 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} ${PROJECT_NAME}.self
   VERSION ${VITA_VERSION} NAME ${VITA_APP_NAME}
   FILE sce_sys/icon0.png sce_sys/icon0.png
        sce_sys/livearea/contents/bg0.png sce_sys/livearea/contents/bg0.png
-       sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml)
+       sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
+       assets/cacert.pem assets/cacert.pem)
 ```
 
-(The exact stub library list will shift as we add features. Treat this as a starting point, not a final file.)
+(The stub list will change as features land. Treat this as a starting point.)
 
 ### 2.4 Getting builds onto the Vita
-
-Assumes the Vita is modded and has **VitaShell** installed.
 
 | Step | How |
 |---|---|
 | Wi-Fi | 2.4 GHz only. WPA2-PSK works. WPA3-only or 5 GHz-only networks do not. |
 | FTP | In VitaShell press `SELECT` to start the FTP server (port `1337`). |
-| Push build | `curl -T build-vita/vita-hermes.vpk ftp://<vita-ip>:1337/ux0:/data/` then install from VitaShell. |
-| Faster loop | Install the **vitacompanion** plugin: it adds remote commands (launch, destroy, reboot) on a TCP port, so a script can upload the `.self`/`eboot.bin`, kill the app and relaunch it with no touching the Vita. Check the plugin README for ports and syntax. |
-| Logs | Use a network debug logger plugin (NetDbg style, UDP) and `nc -ul <port>` on Fedora, or write a log file to `ux0:data/hermes/log.txt`. |
-| Crashes | The Vita writes a `.psp2dmp` core dump on crash. Copy it back and decode with `vita-parse-core` from VitaSDK against the unstripped ELF. Keep the ELF of every build you test. |
+| Push build | `curl -T build-vita/vita_hermes.vpk ftp://<vita-ip>:1337/ux0:/data/`, then install from VitaShell. |
+| Faster loop | **vitacompanion** plugin: remote commands (launch, destroy, reboot) over a TCP port, so a script can upload, kill and relaunch without touching the Vita. Check its README for ports/syntax. |
+| Logs | A network debug-log plugin (UDP) with `nc -ul <port>` on Fedora, or a log file in `ux0:data/hermes/log.txt`. |
+| Crashes | The Vita writes a core dump; copy it back and decode with `vita-parse-core` against the unstripped ELF. Keep the ELF of every tested build. |
 
-A `make deploy` target (or small shell script) should do: build, FTP upload, relaunch, then tail logs. I will write that in milestone M1.
+A `tools/deploy.sh` does: build, FTP upload, relaunch, tail logs. Written in M1.
 
 ### 2.5 Emulator and desktop options
 
 | Option | Use | Caveat |
 |---|---|---|
-| **Vita3K** (emulator, Linux builds exist) | Smoke-test that the VPK boots and draws | Network and IME support are partial **(verify)**. Do not rely on it for HTTP/SSE or keyboard testing. |
-| **Desktop SDL2 build of our own app** | Daily development: UI layout, Markdown, HTTP, SSE, state machine, against a real Hermes or a mock | Not a perfect match for Vita performance and memory. Use for logic and layout; always re-test on hardware. |
-| **Real Vita** | Final truth for performance, memory, touch feel, battery | Needs the modded console on the same LAN. |
+| **Vita3K** | Smoke-test that the VPK boots and draws | Network and IME support partial (**verify**). Not for HTTPS/SSE testing. |
+| **Desktop SDL2 build** | Daily work: UI, Markdown, config, HTTPS, SSE against a mock or your real VPS | Not identical to Vita performance/memory. Always re-test on hardware. |
+| **Real Vita** | Final truth for speed, memory, touch, battery, TLS | Needs the modded console. |
 
 ### 2.6 Editor and tooling
 
-- **VS Code** with clangd and CMake Tools. Point the CMake kit at the Vita toolchain file for the `vita` preset and at the system compiler for the `desktop` preset.
-- CMake presets: `vita` and `desktop`, so `cmake --preset vita` and `cmake --preset desktop` are the only commands you remember.
-- A mock Hermes server (about 50 lines of Python, FastAPI or plain `http.server`) that emits SSE chunks, so UI work does not burn tokens.
+- **VS Code** with clangd and CMake Tools; CMake presets `vita` and `desktop`.
+- **Mock Hermes server** (about 50 lines of Python) that replays recorded SSE, so UI work does not burn tokens.
+- **Config schema** (JSON Schema) so VS Code validates your `config.json` while you edit it.
 
 ---
 
@@ -195,293 +205,449 @@ A `make deploy` target (or small shell script) should do: build, FTP upload, rel
 
 | Concern | Choice | Why | Alternative |
 |---|---|---|---|
-| Language | **C++17** (C-style, no heavy templates, no exceptions) | First-class VitaSDK support, tiny runtime, easy to share between Vita and desktop | C (simpler); Rust via the community Vita target (tier 3, more friction) |
-| Toolchain | **VitaSDK** (GCC for `arm-vita-eabi`, newlib) | The standard homebrew toolchain | None realistic |
-| Build | **CMake + Ninja**, presets | VitaSDK ships CMake macros (`vita_create_vpk`) | Make |
-| Rendering | **vita2d** (GXM-based 2D) | Simple API, textures, text, rectangles | vitaGL + Dear ImGui (faster to build widgets, heavier, immediate-mode UI) |
-| Text | **FreeType via vita2d** with a bundled TTF (Noto Sans + a small symbol font) | Unicode and proper kerning | Bitmap font (fast, ASCII only) |
-| HTTP + streaming | **libcurl** with a write callback that feeds an SSE parser | Handles chunked encoding and keep-alive, available through vdpm | Raw `sceNet` sockets (more work, no TLS) |
-| TLS | **None on the Vita** (HTTP to LAN bridge). Optional **mbedTLS** path later. | See [[#5. Limits and how to overcome them]] | `sceSsl` system library |
-| JSON | **yyjson** (fast, small) or **cJSON** | Low memory | nlohmann/json (heavier compile, fine on desktop only) |
-| Input text | **System IME dialog** (`sceImeDialog`) | The only practical on-screen keyboard on Vita, supports many languages | Custom touch keyboard (more work, but nicer in-app) |
-| Settings / history storage | JSON files in `ux0:data/hermes/` | Simple, user-editable over FTP | SQLite (overkill) |
-| Audio (v2) | `sceAudioIn` (mic) and `sceAudioOut`, decode with opusfile | Native APIs | - |
+| Language | **C++17** (C-style, no exceptions, no heavy templates) | First-class VitaSDK support, shareable with desktop | C; Rust via the community Vita target (tier 3, more friction) |
+| Toolchain | **VitaSDK** | Standard homebrew toolchain | None realistic |
+| Build | **CMake + Ninja**, presets | VitaSDK macros (`vita_create_vpk`) | Make |
+| Rendering | **vita2d** | Simple 2D, textures, text | vitaGL + Dear ImGui (faster forms, heavier, less control) |
+| Text | **FreeType** with bundled Latin TTFs (proportional + monospace) | English-only keeps assets small | Bitmap font (fastest, less pretty) |
+| HTTP + SSE | **libcurl** + write-callback SSE parser | Chunked, keep-alive, TLS | Raw `sceNet` (no TLS) |
+| TLS | **mbedTLS via libcurl, bundled CA file, TLS 1.2** | System SSL library is too old for a public VPS | `sceSsl` (rejected) |
+| JSON | **yyjson** | Small, fast, mutable docs for config writing | cJSON |
+| Config | JSON files in `ux0:data/hermes/` + schema | User-editable over FTP, versionable | SQLite (overkill) |
+| Scripting (v3) | **Lua 5.4**, vendored source | Tiny, sandboxable, familiar to homebrew users | None / hard-coded macros |
+| Text input | **System IME dialog** (`sceImeDialog`) | Only practical system keyboard | Custom touch keyboard (optional later, more customizable) |
+| Audio (v2) | `sceAudioIn` / `sceAudioOut`, opusfile | Native | - |
+| Server side | **Caddy + small bridge (Python FastAPI or Go)** on the VPS | TLS termination, auth, scoping, STT/TTS, image resize | nginx + custom |
 | Desktop dev build | **SDL2 + SDL2_ttf + libcurl** behind the same `Platform` interface | Fast iteration on Fedora | - |
-| Bridge (optional but recommended) | **Python (FastAPI) or Go** single binary behind Caddy | TLS, auth, trimming, STT/TTS, image resizing | Run without bridge on trusted LAN |
 
 ---
 
 ## 4. Architecture
 
-### 4.1 Layers
+### 4.1 System
 
 ```mermaid
 flowchart LR
   subgraph Vita["PS Vita app"]
-    UI["UI layer (screens, widgets, Markdown layout)"]
-    Core["Core (chat model, SSE parser, settings, history)"]
+    UI["UI (screens, widgets, themes, markdown layout)"]
+    Cfg["Config + profiles + macros (JSON)"]
+    Core["Core (chat model, SSE parser, history)"]
     Plat["Platform interface"]
-    V["Vita impl: vita2d, sceCtrl/Touch, sceImeDialog, libcurl"]
-    UI --> Core --> Plat --> V
+    V["Vita impl: vita2d, touch/ctrl, IME, libcurl+mbedTLS"]
+    UI --> Core
+    Cfg --> UI
+    Cfg --> Core
+    Core --> Plat --> V
   end
   subgraph Desktop["Desktop dev build (Fedora)"]
-    D["SDL2 impl: window, mouse as touch, keyboard, libcurl"]
+    D["SDL2 impl"]
   end
   Plat -. same interface .-> D
-  V -- "HTTP + SSE (LAN)" --> Bridge
-  D -- "HTTP + SSE" --> Bridge
-  Bridge["Bridge / reverse proxy (optional)"] -- "HTTP(S) localhost" --> Hermes["Hermes API server :8642"]
+  V -- "HTTPS TLS1.2 + bearer token" --> Caddy
+  D -- "HTTPS" --> Caddy
+  subgraph VPS["Your VPS"]
+    Caddy["Caddy (TLS, rate limit)"] --> Bridge["Bridge (auth, scope, STT/TTS)"]
+    Bridge -- "localhost only" --> Hermes["Hermes API :8642"]
+  end
 ```
 
-Key rule: **`core/` and `ui/` never include a Vita header.** Everything that touches hardware goes through a small `Platform` interface (draw, text metrics, input events, clock, file IO, HTTP, IME). That is what makes the Fedora SDL2 build possible.
+Key rule: **`core/` and `ui/` never include a Vita header.** All hardware access goes through a small `Platform` interface (draw, text metrics, input events, time, files, HTTP, IME, audio). That is what makes the Fedora SDL2 build possible.
 
-### 4.2 Suggested repo layout
+### 4.2 Repo layout
 
 ```
 vita-hermes/
   CMakeLists.txt  CMakePresets.json
   src/
-    core/        # chat model, SSE parser, settings, history (no platform includes)
-    ui/          # screens, widgets, markdown layout, theme
-    net/         # HTTP client interface + curl impl
+    core/        # chat model, SSE parser, history, profile manager (no platform includes)
+    config/      # loader, schema validation, migration, hot reload
+    ui/          # screens, widgets, themes, markdown layout, input mapping
+    net/         # HTTP client interface + curl/mbedTLS impl
+    script/      # Lua host API (v3)
     platform/
       vita/      # vita2d, controls, touch, IME, audio
       sdl2/      # desktop dev build
-  assets/        # fonts, icons, LiveArea art
+  assets/        # fonts, icons, default theme, cacert.pem
   sce_sys/       # icon0.png (128x128), livearea/contents/{bg0.png,template.xml}
-  tools/         # mock_hermes.py, deploy.sh
-  bridge/        # optional proxy (Python/Go) + Caddyfile
+  schema/        # JSON Schemas for config, theme, profile, macros
+  tools/         # mock_hermes.py, deploy.sh, setup-fedora.sh, gen-token.sh
+  bridge/        # FastAPI or Go bridge + Caddyfile + systemd unit
   docs/
 ```
 
 ### 4.3 Streaming flow
 
-1. User types a message through the IME dialog and presses send.
-2. Core appends it to the conversation and starts a worker thread (`sceKernelCreateThread` on Vita; `std::thread` on desktop).
-3. The worker does `POST /v1/chat/completions` with `stream: true` through libcurl.
-4. A write callback feeds raw bytes to the SSE parser. Each `data: {...}` line is parsed for `choices[0].delta.content` and pushed to a lock-protected queue. `data: [DONE]` ends the turn.
-5. The UI thread drains the queue each frame, appends to the visible message and re-lays-out only the last paragraph.
+1. User types via the IME dialog (or picks a macro) and sends.
+2. Core appends the message and starts a worker thread (`sceKernelCreateThread` on Vita, `std::thread` on desktop).
+3. Worker does `POST /v1/chat/completions` with `stream: true` through libcurl over HTTPS.
+4. Write callback feeds bytes to the SSE parser; each `data: {...}` chunk yields `choices[0].delta.content` into a lock-protected queue; `[DONE]` ends the turn.
+5. UI thread drains the queue each frame and re-lays-out only the streaming paragraph.
 6. Cancel is a flag checked in curl's progress callback.
+7. On network drop mid-stream, keep the partial reply, mark it "interrupted", offer retry or continue.
 
-Keep all network work off the render thread; a 60 fps UI that freezes during a request would feel broken.
+All networking stays off the render thread.
 
 ### 4.4 UI sketch (960x544, touch + buttons)
 
-- Top bar: connection dot, model/agent name, battery, menu.
-- Main area: scrollable message list. Drag with touch; **left stick** and **D-pad** also scroll. **Rear touch** can be added for scrolling later.
-- Bottom bar: text field (tap opens IME), send button. **Cross** = send, **Circle** = cancel/back, **Triangle** = new chat, **Start** = settings.
-- Font size options (18/22/26 px) because 5-inch OLED text gets small fast.
+- Top bar: connection dot, active profile name, model, battery.
+- Message list: scroll by touch drag, left stick, D-pad (rear touch optional).
+- Bottom bar: text field (tap opens IME), send, quick-prompt button.
+- Default mapping: Cross = send, Circle = cancel/back, Triangle = new chat, Square = macros menu, Start = settings. **All remappable** ([[#5. Customization architecture]]).
 
 ---
 
-## 5. Limits and how to overcome them
+## 5. Customization architecture
+
+Customization is designed in from M2 so every later feature plugs into it instead of hard-coding behavior.
+
+### 5.1 Layers (from easy to powerful)
+
+| Layer | What you can change | How | Milestone |
+|---|---|---|---|
+| **1. Settings UI** | Server, token, font size, theme, brightness, haptics | In-app screens | M3-M5 |
+| **2. JSON config** | Everything in layer 1 plus button map, layout, defaults | Edit `config.json` over FTP or on desktop (schema validated) | M2 |
+| **3. Profiles** | Multiple endpoints, tokens, models, system prompts, per-profile theme | `profiles/*.json`, switch in-app | M5 |
+| **4. Themes** | Colors, fonts, spacing, bubble style, terminal-style vs bubbles | `themes/*.json` + optional font files | M5 |
+| **5. Macros / quick prompts** | One-tap prompts with variables (`{clipboard}`, `{date}`, `{last_reply}`) | `macros.json`, menu on Square | M5 |
+| **6. Input mapping** | Remap every button, touch zone, rear-touch gesture to an action | `input.json` | M5 |
+| **7. Lua scripting** | Custom commands, pre/post-processing of messages, small widgets | `scripts/*.lua`, sandboxed | v3 |
+
+### 5.2 Data layout on the memory card
+
+```
+ux0:data/hermes/
+  config.json            # global settings
+  input.json             # button / touch / rear-touch mapping
+  macros.json            # quick prompts
+  profiles/
+    main.json            # one per agent/endpoint
+    work.json
+  themes/
+    default.json
+    terminal-green.json
+  fonts/                 # optional user fonts (TTF)
+  history/               # one JSON file per conversation
+  scripts/               # Lua (v3)
+  log.txt
+```
+
+### 5.3 Example files
+
+`config.json`:
+
+```json
+{
+  "schema": 1,
+  "active_profile": "main",
+  "theme": "default",
+  "ui": { "font_size": 22, "show_battery": true, "auto_scroll": true, "markdown": true },
+  "power": { "cpu_mhz": 333, "dim_after_s": 60 },
+  "history": { "max_messages_in_memory": 200, "keep_on_disk": true }
+}
+```
+
+`profiles/main.json`:
+
+```json
+{
+  "schema": 1,
+  "name": "Main agent",
+  "base_url": "https://hermes.example.com/v1",
+  "token_file": "ux0:data/hermes/secrets/main.token",
+  "model": "hermes",
+  "system_prompt": "You are talking to me on a PS Vita. Keep answers short.",
+  "stream": true,
+  "timeout_s": 120,
+  "pin_ca": "assets/cacert.pem"
+}
+```
+
+`macros.json`:
+
+```json
+{
+  "schema": 1,
+  "macros": [
+    { "label": "Summarize",  "prompt": "Summarize this in 3 bullets: {last_reply}", "button": "SQUARE+1" },
+    { "label": "Status",     "prompt": "Give me a one-line status of my VPS tasks." },
+    { "label": "Today",      "prompt": "What should I focus on today? It is {date}." }
+  ]
+}
+```
+
+`input.json` (excerpt):
+
+```json
+{
+  "schema": 1,
+  "buttons": { "CROSS": "send", "CIRCLE": "cancel", "TRIANGLE": "new_chat",
+               "SQUARE": "macro_menu", "START": "settings",
+               "L": "scroll_page_up", "R": "scroll_page_down" },
+  "touch": { "swipe_left_edge": "history_menu" },
+  "rear": { "swipe_up": "scroll_up", "swipe_down": "scroll_down" }
+}
+```
+
+### 5.4 Design rules
+
+- **Every setting has a default**; a missing or broken file never prevents the app from starting (log, fall back, show a toast).
+- **Versioned schemas** (`"schema": N`) with migration code, so updating the app does not break your files.
+- **Hot reload**: one button combo re-reads config, theme and macros without restarting.
+- **Same files on desktop and Vita**: edit on Fedora, FTP over, or sync the folder.
+- **Secrets in separate files** (`secrets/*.token`), never in `config.json`, so you can share configs and themes safely.
+- **Export/import**: a "bundle" `.zip` of config + themes + macros (not secrets).
+- **Scripting sandbox (v3)**: no raw file or socket access; only the host API (`send(text)`, `on_reply(fn)`, `notify(msg)`, `get_profile()`), with time and memory limits.
+
+---
+
+## 6. Security model for a public VPS
+
+> [!danger] Why this matters
+> Hermes Agent can use tools on the machine it runs on. Anyone holding a valid Vita token can potentially make that agent act. Treat the Vita as a **low-trust, easily lost device**.
+
+### 6.1 Controls
+
+| Control | Detail |
+|---|---|
+| **Hermes stays on localhost** | Never bind it to `0.0.0.0` or open port 8642 in the VPS firewall. |
+| **Caddy in front** | HTTPS on 443 with a normal Let's Encrypt certificate for your domain. Disable response buffering so SSE streams (`flush_interval -1` on `reverse_proxy`). |
+| **Bridge in the middle** | Validates a **per-device token**, allows only the endpoints the Vita needs (`/v1/chat/completions`, `/v1/models`, later `/stt`, `/tts`), caps request size, forwards to Hermes with the real `API_SERVER_KEY` the Vita never sees. |
+| **Per-device, revocable tokens** | One token per device/profile, 32+ random bytes, stored hashed on the VPS. Revoke by deleting one entry. `tools/gen-token.sh` creates them. |
+| **Rate limiting** | Per token and per IP, plus fail2ban on repeated 401s. |
+| **Optional mTLS** | A client certificate bundled on the Vita (mbedTLS supports it) as a second factor. Heavier to manage; recommended if you ever share the VPS with other services. |
+| **Agent scoping** | Use a dedicated Hermes profile/toolset for Vita sessions with the riskiest tools off (shell, file deletion, payments) or behind an approval step. Pending approvals can be answered from the Vita in v3. **Verify** what Hermes exposes for this. |
+| **Audit log** | Bridge logs token id, timestamp, size, status. No message bodies by default. |
+| **Lost Vita plan** | Revoke the token, rotate if mTLS is used, check the audit log. Document it in `docs/`. |
+| **Token storage on the Vita** | Plain file on the memory card (the Vita has no secure keystore for homebrew). Mitigated by revocation, scoping and, optionally, a PIN that decrypts the token at app start (v2). |
+
+### 6.2 Caddy snippet (idea)
+
+```caddyfile
+hermes.example.com {
+    encode zstd gzip
+    request_body { max_size 1MB }
+    reverse_proxy 127.0.0.1:9000 {     # the bridge, not Hermes
+        flush_interval -1              # do not buffer SSE
+        transport http { read_timeout 5m }
+    }
+}
+```
+
+TLS defaults in Caddy (TLS 1.2 and 1.3, ECDHE with AES-GCM or ChaCha) work with a TLS 1.2 client. Do not restrict to TLS 1.3 only, or the Vita cannot connect.
+
+---
+
+## 7. Limits and how to overcome them
 
 ### Summary table
 
 | # | Limit | Impact | Mitigation |
 |---|---|---|---|
-| 1 | **TLS / certificates**: the Vita's system SSL library and CA store are old; modern sites using TLS 1.3-only or new root CAs fail | Cannot directly reach HTTPS endpoints exposed to the internet | Talk **HTTP to a LAN bridge** (recommended). Optional: bundle mbedTLS + your own CA and pin it. |
-| 2 | **No Tailscale / VPN**, 2.4 GHz Wi-Fi only | Cannot reach a home server from outside by itself | Use a phone hotspot on 2.4 GHz plus a public bridge with HTTPS and a strong token, or a Cloudflare/Caddy tunnel terminating modern TLS in front of an HTTP-friendly path (see below) |
-| 3 | **Plaintext LAN traffic** | Token and chats visible to anyone on the LAN | Put the bridge on a trusted/IoT VLAN, use a per-device low-privilege token, rate-limit, optionally pin your own CA with mbedTLS (TLS 1.2, ECDSA/RSA certs) |
-| 4 | **Memory**: 512 MB total, homebrew gets a limited slice, and heap size must be requested | Large chat history or big textures cause crashes | Set heap in code (`_newlib_heap_size_user`), cap in-memory history, page old messages to disk, use small texture atlases |
-| 5 | **CPU**: ~333 MHz default, up to 444 MHz | Heavy Markdown parsing or relayout stutters | Lay out incrementally, only the streaming paragraph; raise clocks with `scePowerSetArmClockFrequency` only when needed to save battery |
-| 6 | **Text input**: no hardware keyboard | Long prompts are painful | IME dialog; voice input (v2); canned prompts / quick replies; accept text from a companion web page or phone (see below) |
-| 7 | **Fonts and glyphs**: emoji, CJK, complex scripts | Missing glyphs show as boxes | Bundle Noto Sans plus a fallback; strip or substitute emoji in the bridge; limit scope to Latin first |
-| 8 | **Screen size**: 960x544 | Wide code blocks and tables are unreadable | Horizontal scroll for code, collapse tables, bridge can simplify Markdown |
-| 9 | **Modded console required** | Not distributable to stock Vitas | Document the requirement; target current community firmware and plugins |
-| 10 | **Background execution**: app is suspended when you press PS | Streaming dies if you leave the app | Persist partial reply; resume or re-request on return; show a clear "interrupted" state |
-| 11 | **Battery**: Wi-Fi + OLED at full brightness drain quickly | Short sessions | Dim UI, lower frame rate when idle, no polling |
-| 12 | **Agent features designed for chat apps** (long tool runs, files, approvals) | Vita cannot render everything | Bridge condenses tool output into one-line status events; link-out for large artifacts |
-| 13 | **Hermes API behavior unknown to me** (sessions, tool events, streaming format) | May need protocol tweaks | Spike in M0: curl the real server, record the SSE stream, then design the parser from real data |
-| 14 | **Browser/WebView is ancient** | Cannot reuse a web UI | Native app; the Vita browser is only useful for a bare-bones fallback (see [[#9. Alternatives considered]]) |
+| 1 | **TLS / certificates**: system SSL library is old | Cannot trust modern HTTPS sites | libcurl + mbedTLS, TLS 1.2, **bundled CA file**, correct Vita clock (see 7.1) |
+| 2 | **No VPN/Tailscale** on Vita | Cannot use private networking | Public HTTPS endpoint with token + rate limits ([[#6. Security model for a public VPS]]) |
+| 3 | **Memory**: 512 MB total; homebrew gets a slice and the heap must be requested | Big histories/textures crash | Set heap in code, cap in-memory history, page to disk, small texture atlases |
+| 4 | **CPU**: 333 MHz default, up to 444 MHz | Heavy Markdown layout stutters | Incremental layout, raise clock only when needed |
+| 5 | **Text input**: no keyboard | Long prompts hurt | IME dialog, **macros**, voice (v2), companion web page |
+| 6 | **Screen**: 960x544 | Wide code/tables unreadable | Horizontal scroll for code, simplified tables, bridge can condense output |
+| 7 | **Fonts** (English only) | Emoji/unusual glyphs show as boxes | Bundle a Latin font + symbols; bridge replaces emoji with text like `:smile:` |
+| 8 | **Suspend on PS button** | Streaming dies when you leave | Keep partial reply; "interrupted" state; resume/retry |
+| 9 | **Wi-Fi: 2.4 GHz, unstable roaming** | Dropped streams on the go | Timeouts, retry with backoff, resumable turns where Hermes allows (**verify**) |
+| 10 | **Battery** | Short sessions | Dimming, idle frame rate, no polling |
+| 11 | **Latency to VPS** | Slow first token | Keep-alive connections, small payloads, optional "typing" indicator from first byte |
+| 12 | **Hermes API unknowns** (sessions, tool events) | Protocol tweaks | M0 spike against your real server before UI work |
+| 13 | **Modded console only** | Not for stock Vitas | Fine for you; document requirements if you publish |
+| 14 | **Old Vita browser** | Cannot reuse web UIs | Native app |
 
-### 5.1 The TLS problem in more detail
+### 7.1 TLS and certificates
 
-You have three realistic options:
+The plan for HTTPS to your VPS:
 
-| Option | How | Pros | Cons |
-|---|---|---|---|
-| **A. Plain HTTP to a LAN bridge** (recommended for MVP) | Hermes (or bridge) listens on LAN. Vita uses `http://192.168.x.y:8642`. | Zero TLS code on Vita, works today, easiest to debug | Not safe on untrusted networks |
-| **B. Own TLS with mbedTLS + pinned CA** | Run Caddy with a certificate from a private CA you generate (ECDSA P-256, TLS 1.2 enabled). The Vita app ships that CA cert and verifies against it only. | Encrypted on the LAN; no dependence on the Vita system CA store | More setup; need to confirm which TLS versions/ciphers the vdpm mbedTLS build supports |
-| **C. System `sceSsl`** | Use the console's own library | Less code | Old trust store and protocol limits; unreliable against modern servers |
+1. **Caddy gets a Let's Encrypt certificate** for `hermes.yourdomain`.
+2. The app bundles `assets/cacert.pem` containing the roots we need (at minimum the ISRG Root X1 chain; a trimmed Mozilla bundle is fine). **Verify** the exact chain your certificate uses; Let's Encrypt has changed intermediates over time.
+3. libcurl options: `CURLOPT_CAINFO` = bundled file, `CURLOPT_SSL_VERIFYPEER=1`, `CURLOPT_SSL_VERIFYHOST=2`, `CURLOPT_SSLVERSION=CURL_SSLVERSION_TLSv1_2` (minimum).
+4. **Verify the hostname** and never fall back to "insecure" mode. A debug-only switch may exist in the desktop build only.
+5. **Clock**: certificate validation needs a correct date. The Vita's clock can drift or reset; the app warns clearly on "certificate not yet valid / expired" instead of showing a generic network error.
+6. **Pinning option**: a profile can pin your own CA or the server's public key hash (`CURLOPT_PINNEDPUBLICKEY`) for an extra layer, at the cost of updating the app when you rotate keys.
+7. **Fallback if the mbedTLS port cannot do what we need**: terminate TLS with a certificate from a private ECDSA CA (bundled in the app), or, worst case, use a dedicated TLS 1.2-friendly front proxy. Decide in M0/M3 based on a real test.
 
-Plan: ship **A** in the MVP, add **B** as an opt-in setting in v1. Skip C.
+> [!tip] First proof to run (M0 desktop, M3 Vita)
+> `curl --tlsv1.2 --tls-max 1.2 https://hermes.yourdomain/v1/models -H "Authorization: Bearer ..."` from Fedora, then the same from the Vita app. If both work, the architecture is proven.
 
-### 5.2 Reaching Hermes away from home
+### 7.2 Text input beyond the IME
 
-The Vita cannot run Tailscale. Options, in order of simplicity:
+- **Macros** (customization layer 5): the fastest fix for repeated prompts.
+- **Voice** (v2): Vita mic to 16 kHz mono PCM, upload to the bridge, STT (for example Whisper) on the VPS, transcript sent to Hermes.
+- **Companion page**: the bridge serves a small authenticated web page; type on a phone or PC and the text lands in the Vita's active chat.
 
-1. **Home only**: Hermes on the LAN. Done.
-2. **Public bridge**: Caddy on a VPS or home router forwards to Hermes, with a long random bearer token and rate limiting. If the Vita cannot negotiate its TLS (point 1 above), expose a dedicated, narrowly-scoped HTTP path through a private tunnel and accept the trade-off, or use option B with your own CA on a public hostname.
-3. **Phone hotspot** (2.4 GHz) to bridge on a reachable host.
+### 7.3 Output beyond text (v2)
 
-Treat anything public as hostile: separate token for the Vita, scoped permissions, request size limits, and logging.
-
-### 5.3 Text input beyond the IME
-
-- **Voice** (v2): Vita has a built-in mic. Record 16 kHz mono PCM with `sceAudioIn`, upload to the bridge, run Whisper (or any STT) there, forward the transcript to Hermes. This is likely the best UX upgrade.
-- **Companion page**: the bridge serves a tiny web page on the LAN; you type on your phone or PC and the text lands in the Vita's current chat. Cheap to build, helpful for long prompts.
-
-### 5.4 Output beyond text (v2)
-
-- **TTS**: bridge synthesizes speech and returns Opus or OGG; the Vita decodes with opusfile and plays via `sceAudioOut`. Or return raw 48 kHz PCM for a first version (bigger but trivial).
-- **Images**: bridge downscales to <= 960x544 JPEG/PNG so the Vita decodes small files only.
-- **Code blocks**: monospaced font, horizontal scroll, no syntax highlighting at first.
+- **TTS**: bridge synthesizes Opus/OGG; Vita decodes with opusfile and plays via `sceAudioOut`.
+- **Images**: bridge downscales to at most 960x544.
+- **Code blocks**: monospace, horizontal scroll, optional simple syntax colors from the theme.
 
 ---
 
-## 6. Implementation plan (milestones)
+## 8. Implementation plan (milestones)
 
-Each milestone ends with something you can run and judge. Times assume part-time work by one developer comfortable with C/C++.
+Times assume part-time work by one developer comfortable with C/C++. Milestones are reordered versus v1 so that **HTTPS** and **config** come before UI polish.
 
-### M0 - Spike and de-risk (0.5-1 day)
+### M0 - Spike and de-risk (1-2 days)
 
-- [ ] Run Hermes with the API server enabled; `curl` `/v1/models` and a streaming `/v1/chat/completions`; save the raw SSE output into `docs/samples/`.
-- [ ] Write `tools/mock_hermes.py` that replays those samples.
-- [ ] Confirm session behavior (does Hermes keep context by itself or do we resend history?).
-- [ ] Confirm what the stream shows during tool use.
-- [ ] Confirm your Vita is modded, VitaShell FTP works, and note firmware version.
+- [ ] On the VPS: enable the Hermes API server (localhost only), note version and settings.
+- [ ] Put Caddy in front (HTTPS, no buffering) and test streaming from Fedora with `curl`.
+- [ ] Record raw SSE output into `docs/samples/`; write `tools/mock_hermes.py` that replays it.
+- [ ] Confirm session behavior (server-side context or resend history) and what the stream shows during tool use.
+- [ ] Decide bridge implementation (FastAPI vs Go) and write the minimal token-checking bridge.
+- [ ] Confirm exact firmware, FTP and plugin setup on the Vita.
 
-**Exit:** protocol notes written; decision on bridge yes/no.
+**Exit:** protocol notes written; HTTPS streaming proven from the desktop; bridge skeleton running.
 
-### M1 - Toolchain and hello world on hardware (0.5-1 day)
+### M1 - Toolchain and hello world on hardware (1 day)
 
 - [ ] Install VitaSDK on Fedora ([[#2. Local dev environment on Fedora]]).
 - [ ] Draw text with vita2d, read buttons and touch, exit cleanly.
-- [ ] `make deploy` script: build, upload, relaunch, tail logs.
-- [ ] LiveArea assets (icon0 128x128, bg0 840x500, template.xml).
+- [ ] `tools/deploy.sh`: build, upload, relaunch, tail logs.
+- [ ] LiveArea assets.
 
-**Exit:** a branded "Hermes" app launches from the LiveArea and reacts to touch.
+**Exit:** a branded app launches from the LiveArea and reacts to input.
 
-### M2 - Platform abstraction and desktop build (1-2 days)
+### M2 - Platform layer and config system (2-3 days)
 
-- [ ] Define the `Platform` interface; implement SDL2 and Vita backends.
-- [ ] CMake presets `vita` and `desktop`.
+- [ ] `Platform` interface with SDL2 and Vita backends; CMake presets.
+- [ ] Config loader: defaults, schema validation, migration, hot reload, logging of bad files.
 - [ ] Basic widgets: label, scroll view, button, text field.
 
-**Exit:** the same UI runs on Fedora and on the Vita.
+**Exit:** same UI on Fedora and Vita, driven by `config.json`.
 
-### M3 - Networking and streaming (2-3 days)
+### M3 - HTTPS and streaming (3-4 days)
 
-- [ ] libcurl wrapper with worker thread, timeouts, cancel.
-- [ ] SSE parser with unit tests (split chunks, multi-line `data:`, `[DONE]`, malformed JSON). Tests run on the desktop.
-- [ ] Settings screen (host, port, token) stored as JSON; connection test button.
-- [ ] Streaming a reply into the message list.
+- [ ] libcurl + mbedTLS build on the Vita; bundled CA file; TLS 1.2 test against your VPS.
+- [ ] SSE parser with unit tests (split chunks, multi-line data, `[DONE]`, bad JSON), run on desktop.
+- [ ] Worker thread, timeouts, cancel, retry with backoff.
+- [ ] Minimal profile (base URL, token file) and connection test.
+- [ ] Streamed replies shown in the message list.
+- [ ] Clear TLS error messages (clock, certificate chain, hostname).
 
-**Exit:** real streamed answers from Hermes on the Vita over Wi-Fi. **This is the MVP.**
+**Exit:** real streamed answers from your VPS over HTTPS on the Vita. **This is the MVP.**
 
-### M4 - Input and UX polish (2-4 days)
+### M4 - Input and UX basics (2-4 days)
 
-- [ ] `sceImeDialog` integration (UTF-8 <-> UTF-16 conversion, cancel handling).
-- [ ] Scrollback with touch drag and stick, auto-scroll while streaming (stops when the user scrolls up).
-- [ ] Error states: Wi-Fi off, 401, timeout, Hermes down; retry button.
-- [ ] Font size setting, dark theme, battery indicator.
+- [ ] `sceImeDialog` integration (UTF-8/UTF-16, cancel).
+- [ ] Touch and stick scrolling, auto-scroll that stops when you scroll up.
+- [ ] Error states: Wi-Fi off, 401, timeout, server down, clock wrong.
+- [ ] Font size, battery indicator.
 
 **Exit:** usable for real conversations.
 
-### M5 - History and Markdown (3-5 days)
+### M5 - Customization layer (4-6 days)
 
-- [ ] Persist conversations to `ux0:data/hermes/`, list / rename / delete.
-- [ ] Minimal Markdown: headings, bold/italic, inline code, fenced code blocks, lists, links shown as text.
-- [ ] Memory caps and message paging.
+- [ ] Profiles (multiple endpoints/tokens/models/system prompts), in-app switcher.
+- [ ] Themes (colors, fonts, bubble vs terminal style), live preview.
+- [ ] Macros menu with variables.
+- [ ] Input mapping from `input.json`, including rear touch.
+- [ ] Bundle export/import; JSON Schemas published in `schema/`.
 
-**Exit:** v1 feature set.
+**Exit:** you can reshape the app without rebuilding it.
 
-### M6 - Bridge and security (2-4 days)
+### M6 - History, Markdown and security hardening (4-6 days)
 
-- [ ] Small bridge (FastAPI or Go) that authenticates the Vita token, forwards to Hermes, strips unsupported content, resizes images.
-- [ ] Caddy config; optional private-CA TLS + mbedTLS pinning in the app.
-- [ ] Rate limiting and logging; document network placement.
+- [ ] Persist and manage conversations.
+- [ ] Minimal Markdown: headings, bold/italic, inline code, fenced code, lists, links as text.
+- [ ] Memory caps and paging.
+- [ ] Bridge: per-device hashed tokens, rate limits, audit log, revoke tooling, systemd unit, fail2ban.
+- [ ] Optional token PIN and optional mTLS.
 
-**Exit:** safe-enough LAN deployment, and a path to remote use.
+**Exit:** v1. Safe enough to leave on a public VPS.
 
 ### M7 - Voice and media (1-2 weeks)
 
-- [ ] Mic recording, upload, STT on bridge.
+- [ ] Mic recording, upload, STT on the VPS.
 - [ ] TTS playback.
-- [ ] Camera / image attach (resize on device or bridge).
+- [ ] Camera / image attach, resized on device or bridge.
 
 **Exit:** hands-free-ish chat with the agent.
 
-### M8 - Agent-aware features (1-2 weeks, optional)
+### M8 - Scripting and agent features (1-2 weeks, optional)
 
-- [ ] Tool-activity status line.
-- [ ] Approve/deny pending agent actions from the Vita (depends on what Hermes exposes; **verify**).
+- [ ] Embedded Lua with the sandboxed host API; example scripts.
+- [ ] Tool-activity status line; approve/deny pending agent actions (depends on Hermes, **verify**).
 - [ ] Notifications when a long task finishes.
+
+**Exit:** the Vita becomes a programmable remote for your agent.
 
 ---
 
-## 7. Complexity and effort estimate
+## 9. Complexity and effort estimate
 
 | Scope | Effort (part-time) | Difficulty | Notes |
 |---|---|---|---|
-| MVP (M0-M3) | ~1-2 weekends, ~25-40 h | Low-medium | Most time goes to toolchain setup and the streaming parser |
-| v1 (M0-M6) | ~3-4 weeks | Medium | UI and text layout are the long pole |
-| v2 (M7) | +1-2 weeks | Medium-high | Audio APIs and codecs on Vita are fiddly |
-| Full (M0-M8) | ~6-8 weeks | Medium-high | Depends on what Hermes exposes for approvals/tool events |
+| MVP (M0-M3) | ~2 weekends, 35-50 h | Medium | Extra time versus v1 for HTTPS, bridge and Caddy |
+| v1 (M0-M6) | ~4-6 weeks | Medium | Customization, layout and hardening are the long poles |
+| v2 (M7) | +1-2 weeks | Medium-high | Audio APIs and codecs are fiddly |
+| Full (M0-M8) | ~7-9 weeks | Medium-high | Depends on what Hermes exposes for approvals/tool events |
 
-**Why it is not harder:** the Vita does not run the agent, HTTP + SSE is simple, and VitaSDK has packaged libcurl, freetype and vita2d.
+**Why it is manageable:** the Vita runs no AI; HTTP + SSE is simple; VitaSDK packages libcurl, mbedTLS, freetype and vita2d; English-only removes font and input complexity.
 
-**Why it is not trivial:** Vita-specific plumbing (IME dialog, threading, suspend/resume, memory), text rendering and layout, and the TLS/security story.
-
-**Compared with the 3DS clients you saw:** this is the same shape (thin client plus remote brain). The Vita has far more RAM, CPU, a better screen and a nicer toolchain, so you can aim higher (Markdown, voice, history).
+**Where the difficulty is:** TLS on a 2011 console, Vita-specific plumbing (IME, threads, suspend, memory), and designing a config system that stays coherent as features grow.
 
 ---
 
-## 8. Risks
+## 10. Risks
 
 | Risk | Likelihood | Impact | Response |
 |---|---|---|---|
-| Hermes API differs from my assumptions | Medium | Medium | M0 spike before writing UI code |
-| TLS blocks remote use | High | Medium | LAN-first design; bridge; optional pinned-CA TLS |
-| Vita3K cannot test networking | High | Low | Desktop SDL2 build covers logic; real device for the rest |
-| IME dialog quirks (encoding, cancel, focus) | Medium | Low | Isolate in one module; test early (M4) |
+| mbedTLS port cannot connect to your server (version, ciphers, cert chain) | Medium | High | Prove it in M0/M3; fallback proxy or private CA ([[#7.1 TLS and certificates]]) |
+| Stolen/lost Vita token gives agent access | Medium | High | Scoped agent profile, per-device tokens, revoke, rate limit, optional mTLS/PIN |
+| Hermes API differs from assumptions | Medium | Medium | M0 spike before UI work |
+| SSE buffered by a proxy, replies arrive in one lump | Medium | Medium | `flush_interval -1`, test through the full chain |
+| Wrong Vita clock breaks certificate validation | Medium | Low | Detect and explain; offer a settings hint |
+| Config sprawl becomes confusing | Medium | Medium | Schemas, defaults, migrations, docs, example bundle |
 | Memory crashes from long chats | Medium | Medium | Heap config, caps, paging |
-| Homebrew ecosystem changes (plugins, firmware) | Low | Medium | Pin tool versions in a setup script; keep instructions in this repo |
-| Scope creep (voice, images, approvals) | High | Medium | Ship MVP first; tiers are explicit |
-| Security of plaintext tokens | Medium | Medium | Dedicated limited token, trusted network, bridge, optional TLS |
+| Scope creep | High | Medium | Tiers and milestones are explicit; MVP first |
+| Firmware/plugin differences | Low | Medium | Confirm exact firmware (M0); pin tool versions in `setup-fedora.sh` |
 
 ---
 
-## 9. Alternatives considered
+## 11. Alternatives considered
 
 | Option | Verdict |
 |---|---|
-| **Vita's built-in web browser pointing at a minimal server-rendered chat page** (bridge serves plain HTML + a tiny bit of JS or meta-refresh) | Cheapest possible prototype (hours, not days) and a good "Plan 0" to validate the network path. The browser is very old, so expect poor rendering, no modern JS and poor TLS. **Untested on my side.** Useful as a fallback, not a product. |
-| **Lua homebrew player** (LPP-Vita and similar) | Fast to prototype UI, but weaker HTTP/streaming and text support; harder to share code with a desktop build. |
-| **Rust** (community Vita target) | Appealing, but a tier-3 target with a thinner ecosystem. Revisit if you prefer Rust and accept friction. |
-| **vitaGL + Dear ImGui** | Quick to build forms and lists; heavier and less control over chat-bubble layout. Reasonable if you want settings screens fast. |
-| **Make Hermes reachable through an existing messaging gateway** (Telegram/Discord) and use the Vita's browser or a chat client | Hermes already supports messaging platforms, but the Vita cannot run modern clients for them. Not a real option. |
+| **Vita web browser + a tiny server-rendered chat page** | Cheap network-path prototype, but the browser's TLS and rendering are old, so on a public HTTPS VPS it will likely fail. Not recommended now. |
+| **Lua-only homebrew** (LPP-Vita and similar) | Fast UI prototyping, weaker HTTP/TLS/streaming; hard to share code with a desktop build. We use Lua only as an add-on (v3). |
+| **Rust** (community Vita target) | Appealing but tier-3 and a thinner ecosystem. Revisit if you prefer Rust. |
+| **vitaGL + Dear ImGui** | Quick forms; less control over chat layout and theming. Possible for settings screens only. |
+| **No bridge, expose Hermes directly through Caddy** | Simpler, but the Vita would hold the real Hermes key and have full API reach. Rejected for security. |
 
 ---
 
 ## Open questions for you
 
-> [!question] Please answer inline (Obsidian callouts are editable) or reply with numbers.
+> [!question] Answer inline or reply with the numbers. Defaults in brackets are what I will assume.
 
-1. **Is your Vita modded** (HENkaku / Enso, VitaShell installed)? Which firmware and model (1000 OLED, 2000 slim)? The 2000 has an LCD and no OLED but the same software constraints.
-2. **Where does Hermes run** (PC on the LAN, home server, VPS)? Is it already exposing the API server, and what version?
-3. **Remote use**: LAN-only is fine, or do you want to use it away from home?
-4. **Priority features**: is voice (talk to Hermes with the Vita mic) a must-have, or text first?
-5. **Language preference**: C++ (recommended), plain C, or Rust?
-6. **UI style**: minimal chat bubbles, or retro terminal look? (Terminal look is easier and fits the screen well.)
-7. **Distribution**: personal use only, or do you plan to publish the VPK (affects polish, licensing and docs)?
-8. **Agent actions**: do you want to approve or reject risky agent actions from the Vita?
-9. **Desktop build**: OK to carry the SDL2 build as a first-class target? It costs a little structure up front and saves a lot of time.
+1. **Exact firmware** from *Settings > System > System Information* [assume 3.65]. Is Ensō installed (permanent) or do you re-run the exploit after each boot?
+2. **VPS details**: OS, do you already have a **domain name** for it, and is Caddy/nginx already running there? [assume Linux + a domain you can point at it]
+3. **Hermes version** and whether the API server is already enabled. [assume not yet]
+4. **Voice** (mic input, spoken replies): needed soon or later? [later, v2]
+5. **Customization priorities**: which of these matter most? Themes, macros, profiles, button mapping, scripting. [all, in the order of section 5]
+6. **UI default look**: chat bubbles or retro terminal style? [both via themes, bubbles first]
+7. **Language**: C++17 [assume yes] or would you rather use C or Rust?
+8. **Agent safety**: should Vita sessions get a restricted Hermes toolset, with risky actions requiring approval? [yes]
+9. **Distribution**: personal use only, or publish the VPK and bridge? [personal first, publishable structure]
+10. **Bridge language**: Python/FastAPI (quicker to hack) or Go (single binary)? [Python first]
 
 ---
 
 ## Next step after your feedback
 
-If you approve the direction, I would start with **M0 + M1**: protocol spike against your Hermes, the Fedora toolchain script (`tools/setup-fedora.sh`), the CMake presets, and a hello-world VPK with a one-command deploy.
+I would start with **M0 + M1**: `tools/setup-fedora.sh`, CMake presets, a mock Hermes server, the minimal bridge plus Caddyfile for your VPS, and a hello-world VPK with one-command deploy.
 
 ---
 
 ## Sources
 
 - Hermes Agent repo: <https://github.com/NousResearch/hermes-agent>
-- Open WebUI: connecting Hermes Agent (API server settings): <https://docs.openwebui.com/getting-started/quick-start/connect-an-agent/hermes-agent>
+- Open WebUI, connecting Hermes Agent (API server settings): <https://docs.openwebui.com/getting-started/quick-start/connect-an-agent/hermes-agent>
 - Dokploy Hermes template: <https://docs.dokploy.com/docs/templates/hermes>
 - VitaSDK vdpm: <https://github.com/vitasdk/vdpm>
-- 3DBrew (3DS homebrew reference, for comparison): <https://www.3dbrew.org>
-- Vita-specific API details (sceImeDialog, sceAudioIn, heap size symbol, vita-parse-core, vitacompanion, ports) come from my general knowledge of the VitaSDK ecosystem and were **not** re-verified in this session; confirm against the VitaSDK docs and plugin READMEs.
+- 3DBrew (3DS homebrew reference): <https://www.3dbrew.org>
+- Vita-specific API details (IME dialog, audio-in, heap-size symbol, `vita-parse-core`, vitacompanion, mbedTLS capabilities, firmware/Ensō specifics) come from general knowledge of the VitaSDK ecosystem and were **not** re-verified in this session. Confirm against the VitaSDK docs, HENkaku/taiHEN docs and plugin READMEs.
