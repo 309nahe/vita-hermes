@@ -625,15 +625,16 @@ Times assume part-time work by one developer comfortable with C/C++. Milestones 
 > [!question] Answer inline or reply with the numbers. Defaults in brackets are what I will assume.
 
 1. ~~Firmware~~ Confirmed: 3.65 with Ensō.
-2. **VPS details**: OS, do you already have a **domain name** for it, and is Caddy/nginx already running there? [assume Linux + a domain you can point at it]
-3. **Hermes version** and whether the API server is already enabled. [assume not yet]
+2. ~~VPS details~~ Confirmed: domain `nahezepam.fyi`, **you build the bridge yourself** (not part of my work; the plan keeps its spec in section 6 as a reference).
+   Original question: OS, do you already have a **domain name** for it, and is Caddy/nginx already running there? [assume Linux + a domain you can point at it]
+3. ~~Hermes version~~ Confirmed: **0.23**. Still to check: whether the API server is already enabled. [assume not yet]
 4. **Voice** (mic input, spoken replies): needed soon or later? [later, v2]
 5. **Customization priorities**: which of these matter most? Themes, macros, profiles, button mapping, scripting. [all, in the order of section 5]
 6. **UI default look**: chat bubbles or retro terminal style? [both via themes, bubbles first]
 7. **Language**: C++17 [assume yes] or would you rather use C or Rust?
 8. **Agent safety**: should Vita sessions get a restricted Hermes toolset, with risky actions requiring approval? [yes]
 9. **Distribution**: personal use only, or publish the VPK and bridge? [personal first, publishable structure]
-10. **Bridge language**: Python/FastAPI (quicker to hack) or Go (single binary)? [Python first]
+10. ~~Bridge language~~ Yours to choose (Go suggested).
 
 ---
 
